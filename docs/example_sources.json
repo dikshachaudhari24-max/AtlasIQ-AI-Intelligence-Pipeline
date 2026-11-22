@@ -1,0 +1,20 @@
+[
+  {
+    "id": "papers",
+    "name": "arXiv",
+    "category": "RESEARCH_PAPER",
+    "base_url": "https://arxiv.org/",
+    "adapter_name": "arxiv",
+    "rate_limit_config": {"requests_per_minute": 10, "max_concurrency": 1},
+    "enabled": false
+  },
+  {
+    "id": "product-hunt",
+    "name": "Product Hunt",
+    "category": "PRODUCT",
+    "base_url": "https://www.producthunt.com/",
+    "adapter_name": "product-hunt",
+    "rate_limit_config": {"requests_per_minute": 5, "max_concurrency": 1},
+    "enabled": false
+  }
+]

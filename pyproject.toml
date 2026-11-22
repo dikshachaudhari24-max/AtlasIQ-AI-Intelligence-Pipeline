@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlasiq"
+version = "0.1.0"
+description = "AtlasIQ ingestion infrastructure"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg==0.30.0",
+    "aiohttp==3.13.5",
+    "defusedxml==0.7.1",
+    "yarl==1.25.1",
+    "pydantic==2.11.7",
+    "pydantic-settings==2.10.1",
+    "python-dotenv==1.1.1",
+    "typer==0.16.0",
+    "click==8.2.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.1", "pytest-asyncio==1.1.0"]
+
+[project.scripts]
+atlasiq = "atlasiq.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"atlasiq.db" = ["migrations/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: uses a disposable PostgreSQL database",
+    "live_source: explicitly opted-in requests to public source APIs",
+]
