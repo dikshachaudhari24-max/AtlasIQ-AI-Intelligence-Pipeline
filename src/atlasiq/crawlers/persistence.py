@@ -1,3 +1,5 @@
+from uuid import UUID
+
 import asyncpg
 
 from atlasiq.crawlers.base import InvalidRecord, Parsed
@@ -8,7 +10,7 @@ from atlasiq.schemas.entities import Product, ResearchPaper, Startup
 
 async def persist_record(
     connection: asyncpg.Connection, parsed: Parsed, document: asyncpg.Record, metrics: list[Metric],
-) -> str:
+) -> tuple[str, UUID]:
     records = CanonicalRecords(connection)
     record = parsed.record
     key = parsed.canonical_key
@@ -32,13 +34,13 @@ async def persist_record(
         existing = bool(aliases)
         if aliases:
             key = aliases[0]["canonical_key"]
-        paper = await records.upsert_research_paper(
+        row = await records.upsert_research_paper(
             record, canonical_key=key, arxiv_id=metadata["arxiv_id"], doi=metadata["doi"],
             abstract=metadata["abstract"], collected_at=metadata["collected_at"], **args,
         )
         for metric in metrics:
             await records.record_paper_metric(
-                paper_id=paper["id"], repository_url=metric.repository.url,
+                paper_id=row["id"], repository_url=metric.repository.url,
                 repository_identity=metric.repository.identity, association_evidence=metric.evidence,
                 github_stars=metric.stars, observed_at=metric.observed_at,
             )
@@ -46,7 +48,7 @@ async def persist_record(
         existing = await connection.fetchval("""
             SELECT EXISTS (SELECT 1 FROM public.startups WHERE canonical_key = $1)
         """, key)
-        await records.upsert_startup(record, canonical_key=key, **args)
+        row = await records.upsert_startup(record, canonical_key=key, **args)
     elif isinstance(record, Product):
         previous = await connection.fetchrow("SELECT startup_id FROM public.products WHERE canonical_key = $1", key)
         existing = previous is not None
@@ -55,9 +57,9 @@ async def persist_record(
             startup_id = await connection.fetchval(
                 "SELECT id FROM public.startups WHERE canonical_key = $1", metadata["startup_key"],
             ) or startup_id
-        await records.upsert_product(
+        row = await records.upsert_product(
             record, canonical_key=key, product_name=metadata["product_name"], startup_id=startup_id, **args,
         )
     else:
         raise TypeError("unsupported crawler record type")
-    return "UPDATED" if existing else "INSERTED"
+    return ("UPDATED" if existing else "INSERTED"), row["id"]

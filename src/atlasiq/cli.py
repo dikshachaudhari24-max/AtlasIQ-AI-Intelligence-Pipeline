@@ -20,8 +20,11 @@ from atlasiq.crawlers.validation import validate_stored_records
 from atlasiq.db.connection import database_pool, transaction
 from atlasiq.db.migrate import MigrationError, apply_migrations
 from atlasiq.db.models import SourceCategory
+from atlasiq.intelligence.service import IntelligenceError
 from atlasiq.sources.registry import SourceAlreadyRegistered, SourceConfig, SourceNotFound, SourceRegistry
 from atlasiq.tasks.queue import TaskQueue
+from atlasiq.ui.commands import Json, NoColor, Plain, register_operations
+from atlasiq.ui.presentation import Presentation
 
 app = typer.Typer(help="AtlasIQ ingestion platform.", no_args_is_help=True, pretty_exceptions_enable=False)
 db = typer.Typer(help="Check PostgreSQL and manage schema migrations.", no_args_is_help=True)
@@ -40,7 +43,7 @@ class TaskNotFound(Exception):
 
 
 def _failure_message(error: Exception) -> str:
-    if isinstance(error, (ConfigurationError, MigrationError, CrawlError)):
+    if isinstance(error, (ConfigurationError, MigrationError, CrawlError, IntelligenceError)):
         return str(error)
     if isinstance(error, asyncpg.ClientConfigurationError):
         return "PostgreSQL rejected a client setting. Check the connection options in DATABASE_URL."
@@ -68,6 +71,7 @@ def _failure_message(error: Exception) -> str:
 def _execute(
     operation: str, action: Callable[[Settings, asyncpg.Pool], Coroutine[Any, Any, T]],
     *, source_id: str | None = None, task_id: UUID | None = None,
+    error_view: Callable[[str], None] | None = None,
 ) -> T:
     async def run(settings: Settings) -> T:
         async with database_pool(settings) as pool:
@@ -86,7 +90,10 @@ def _execute(
             extra={"operation": operation, "safe_message": message, "task_id": task_id,
                    "duration_ms": (perf_counter() - start) * 1000},
         )
-        typer.echo(message, err=True)
+        if error_view is None:
+            typer.echo(message, err=True)
+        else:
+            error_view(message)
         raise typer.Exit(1) from None
     logger.info(
         "Operation finished",
@@ -248,14 +255,20 @@ def run() -> None:
 def crawl(
     source: Annotated[str, typer.Option(help="Source ID.")],
     limit: Annotated[int, typer.Option(min=1, max=1_000_000, help="Maximum distinct source items.")] = 5,
+    plain: Plain = False, json_output: Json = False, no_color: NoColor = False,
 ) -> None:
     """Discover, validate, and persist records from one configured source."""
-    async def action(settings: Settings, pool: asyncpg.Pool):
-        async with HttpClient(settings) as http:
-            return await IngestionService(pool, settings, http).crawl(source, limit)
+    presentation = Presentation(plain, json_output, no_color, automation_json=True)
+    start = perf_counter()
+    with presentation.execution("Crawl execution") as observer:
+        async def action(settings: Settings, pool: asyncpg.Pool):
+            async with HttpClient(settings) as http:
+                return await IngestionService(pool, settings, http, observer).crawl(source, limit)
 
-    report = _execute("crawl", action, source_id=source)
-    _json(report)
+        report = _execute("crawl", action, source_id=source, error_view=presentation.error)
+    presentation.output(report, lambda renderer: renderer.summary(
+        "Crawl execution", {**report, "duration_seconds": round(perf_counter() - start, 3)},
+    ))
     if report["status"] != "COMPLETED":
         raise typer.Exit(1)
 
@@ -290,3 +303,6 @@ def resume() -> None:
 def export(target: Annotated[str, typer.Option(help="Export target, for example sheets.")]) -> None:
     """Export verified records (future phase)."""
     _scheduled("verified-record export")
+
+
+register_operations(app, _execute)

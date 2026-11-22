@@ -25,6 +25,21 @@ class Settings(BaseSettings):
     github_token: SecretStr | None = None
     google_sheets_spreadsheet_id: SecretStr | None = None
     google_application_credentials: SecretStr | None = None
+    llm_provider_order: str = "gemini,groq,deepseek"
+    llm_gemini_model: str = Field(default="gemini-flash-latest", min_length=1, max_length=100)
+    llm_groq_model: str = Field(default="openai/gpt-oss-120b", min_length=1, max_length=100)
+    llm_deepseek_model: str = Field(default="deepseek-flash", min_length=1, max_length=100)
+    llm_workers: int = Field(default=3, ge=1, le=16)
+    llm_requests_per_minute: int = Field(default=15, ge=1, le=1000)
+    llm_timeout_seconds: int = Field(default=35, ge=1, le=180)
+    llm_provider_attempts: int = Field(default=2, ge=1, le=5)
+    llm_max_retry_wait_seconds: int = Field(default=15, ge=1, le=120)
+    llm_chunk_bytes: int = Field(default=5000, ge=128, le=64000)
+    llm_max_chunks: int = Field(default=24, ge=1, le=128)
+    llm_request_bytes: int = Field(default=30000, ge=4096, le=256000)
+    llm_input_token_budget: int = Field(default=12000, ge=4096, le=256000)
+    llm_output_tokens: int = Field(default=2048, ge=128, le=16384)
+    llm_attempt_budget: int = Field(default=96, ge=1, le=512)
 
     crawler_max_concurrency: Positive = 10
     crawler_request_timeout_seconds: Positive = 30
@@ -37,6 +52,14 @@ class Settings(BaseSettings):
     task_max_attempts: Positive = 5
     task_retry_base_seconds: Positive = 5
     task_retry_max_seconds: Positive = 300
+
+    @field_validator("llm_provider_order")
+    @classmethod
+    def validate_provider_order(cls, value: str) -> str:
+        order = [entry.strip().lower() for entry in value.split(",")]
+        if any(name not in {"gemini", "groq", "deepseek"} for name in order) or len(set(order)) != len(order):
+            raise ValueError("provide a comma-separated list of distinct providers from gemini, groq, deepseek")
+        return ",".join(order)
 
     @field_validator("crawler_user_agent")
     @classmethod

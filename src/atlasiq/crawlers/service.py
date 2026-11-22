@@ -8,6 +8,7 @@ import asyncpg
 from pydantic import ValidationError
 
 from atlasiq.config.settings import Settings
+from atlasiq.core.progress import Observer, emit
 from atlasiq.crawlers.adapters import ADAPTERS, DEFAULTS
 from atlasiq.crawlers.base import BaseCrawler, InvalidRecord
 from atlasiq.crawlers.http_client import FetchError, HttpClient
@@ -16,6 +17,7 @@ from atlasiq.crawlers.runs import STAGE, CrawlState
 from atlasiq.db.connection import transaction
 from atlasiq.db.repositories import IngestionEvidence, RawDocuments
 from atlasiq.enrichment.github import GitHubClient, associations
+from atlasiq.intelligence.storage import enqueue
 from atlasiq.schemas.entities import ResearchPaper
 from atlasiq.sources.registry import SourceAlreadyRegistered, SourceConfig, SourceRegistry
 from atlasiq.tasks.queue import LeaseLost, TaskQueue
@@ -29,12 +31,13 @@ class CrawlError(Exception):
 
 
 class IngestionService:
-    def __init__(self, pool: asyncpg.Pool, settings: Settings, http: HttpClient):
+    def __init__(self, pool: asyncpg.Pool, settings: Settings, http: HttpClient, observer: Observer | None = None):
         self.pool = pool
         self.settings = settings
         self.http = http
         self.github = GitHubClient(http, settings)
         self.worker_id = "worker-" + uuid4().hex
+        self.observer = observer
 
     async def _adapter(self, source_id: str, *, register_default: bool = False) -> BaseCrawler:
         async with self.pool.acquire() as connection:
@@ -105,18 +108,25 @@ class IngestionService:
 
     async def _drive(self, run: asyncpg.Record, adapter: BaseCrawler) -> dict:
         self._log("crawl.start", "Crawl processing started", run)
+        source = adapter.source.id
+        emit(self.observer, "source", "COMPLETED", "Source and database are ready", source)
+        counts = dict.fromkeys(("validated", "persisted", "rejected", "failed_tasks"), 0)
         while True:
-            await self._drain(run["id"], adapter)
+            await self._drain(run["id"], adapter, counts)
             if run["discovery_done"] or (
                 run["discovery_retry_at"] is not None and run["discovery_retry_at"] > datetime.now(UTC)
             ):
                 break
             try:
+                emit(self.observer, "discover", "RUNNING", "Checking source page", source,
+                     discovered=run["discovered_count"])
+                emit(self.observer, "fetch", "RUNNING", "Fetching source evidence", source)
                 page = await adapter.discover(run["cursor"], run["requested_limit"] - run["discovered_count"])
                 if page.next_cursor is not None and page.next_cursor == run["cursor"]:
                     raise FetchError("CURSOR_DID_NOT_ADVANCE")
             except FetchError as error:
                 self._log("crawl.discovery_failure", error.code, run, level=logging.WARNING)
+                emit(self.observer, "discover", "RETRYING" if error.transient else "FAILED", error.code, source)
                 async with self.pool.acquire() as connection:
                     run = await CrawlState(connection).discovery_failure(
                         run["id"], error.code, terminal=not error.transient,
@@ -126,13 +136,22 @@ class IngestionService:
             async with transaction(self.pool) as connection:
                 run = await CrawlState(connection).save_page(run, page, self.settings)
             self._log("crawl.page", "Discovery page committed", run, discovered=run["discovered_count"])
+            emit(self.observer, "fetch", "COMPLETED", "Raw evidence and tasks committed", source,
+                 fetched=run["discovered_count"] + run["duplicate_discoveries"])
         async with self.pool.acquire() as connection:
             report = await CrawlState(connection).report(run, adapter.source.name)
-        counts = {key: value for key, value in report.items() if type(value) is int}
-        self._log("crawl.report", report["status"], run, **counts)
+        final_counts = {key: value for key, value in report.items() if type(value) is int}
+        self._log("crawl.report", report["status"], run, **final_counts)
+        if run["discovery_done"] and not report["discovery_error"]:
+            emit(self.observer, "discover", "COMPLETED", "Discovery checkpoint finalized", source)
+        if report["validated"] or report["rejected"]:
+            validator_state = "FAILED" if not report["validated"] else "PARTIAL" if report["rejected"] else "COMPLETED"
+            emit(self.observer, "validate", validator_state, "Validation outcomes committed", source)
+        emit(self.observer, "canonical", report["status"], "Crawl state committed", source,
+             persisted=report["inserted"] + report["updated"], **final_counts)
         return report
 
-    async def _drain(self, run_id: UUID, adapter: BaseCrawler) -> None:
+    async def _drain(self, run_id: UUID, adapter: BaseCrawler, counts: dict[str, int]) -> None:
         workers = self.settings.crawler_worker_concurrency
         while True:
             async with self.pool.acquire() as connection:
@@ -141,9 +160,18 @@ class IngestionService:
                 tasks = await queue.claim_tasks(self.worker_id, stage=STAGE, limit=workers, crawl_run_id=run_id)
             if not tasks:
                 return
+            emit(self.observer, "validate", "RUNNING", "Validating leased records", adapter.source.id)
             async with asyncio.TaskGroup() as group:
-                for task in tasks:
-                    group.create_task(self._process(task, adapter))
+                processing = [group.create_task(self._process(task, adapter)) for task in tasks]
+            for result in (task.result() for task in processing):
+                if result in {"INSERTED", "UPDATED"}:
+                    counts["validated"] += 1
+                    counts["persisted"] += 1
+                elif result == "REJECTED":
+                    counts["rejected"] += 1
+                elif result == "FAILED":
+                    counts["failed_tasks"] += 1
+            emit(self.observer, "canonical", "RUNNING", "Record outcomes committed", adapter.source.id, **counts)
 
     async def _heartbeat(self, task: asyncpg.Record, lease_lost: asyncio.Event) -> None:
         while True:
@@ -155,7 +183,7 @@ class IngestionService:
                 lease_lost.set()
                 return
 
-    async def _process(self, task: asyncpg.Record, adapter: BaseCrawler) -> None:
+    async def _process(self, task: asyncpg.Record, adapter: BaseCrawler) -> str | None:
         lease_lost = asyncio.Event()
         heartbeat = asyncio.create_task(self._heartbeat(task, lease_lost))
         details = None
@@ -175,8 +203,10 @@ class IngestionService:
                 if lease_lost.is_set():
                     raise LeaseLost
                 async with transaction(self.pool) as connection:
-                    result = await persist_record(connection, parsed, document, metrics)
+                    result, record_id = await persist_record(connection, parsed, document, metrics)
+                    await enqueue(connection, self.settings, document["id"], adapter.category, record_id)
                     await self._settle(connection, task, result, details if details != raw else None)
+                return result
             except (InvalidRecord, ValidationError) as error:
                 reason = error.code if isinstance(error, InvalidRecord) else "CANONICAL_SCHEMA_INVALID"
                 async with transaction(self.pool) as connection:
@@ -189,12 +219,14 @@ class IngestionService:
                     )
                     await self._settle(connection, task, "REJECTED",
                                        details if details != document["raw_content"] else None)
+                return "REJECTED"
             except FetchError as error:
                 async with self.pool.acquire() as connection:
-                    await TaskQueue(connection, self.settings).fail_task(
+                    failed = await TaskQueue(connection, self.settings).fail_task(
                         task["id"], task["claim_token"], error_code=error.code,
                         permanent=not error.transient, minimum_delay=error.delay,
                     )
+                return failed["status"]
         except LeaseLost:
             logger.warning("Task lease lost", extra={
                 "operation": "task.lease_lost", "safe_message": "LEASE_LOST", "task_id": task["id"],

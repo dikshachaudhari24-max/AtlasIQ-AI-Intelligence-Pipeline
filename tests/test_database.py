@@ -20,9 +20,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 TABLES = {
     "sources", "crawl_runs", "raw_documents", "ingestion_tasks", "extraction_attempts", "startups", "products",
     "research_papers", "paper_github_metrics", "jobs", "news", "entity_mappings", "quarantine_records",
-    "crawl_run_items",
+    "crawl_run_items", "intelligence_records",
 }
-MIGRATIONS = ("0001_foundation.sql", "0002_crawling.sql")
+MIGRATIONS = ("0001_foundation.sql", "0002_crawling.sql", "0003_intelligence.sql")
 
 
 async def test_connect_health_and_concurrent_repeatable_migrations(disposable_settings):

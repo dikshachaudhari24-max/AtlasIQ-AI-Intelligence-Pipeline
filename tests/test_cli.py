@@ -54,7 +54,7 @@ def test_database_source_and_task_cli(disposable_settings, monkeypatch, tmp_path
 
     migrated = runner.invoke(app, ["db", "migrate"])
     assert migrated.exit_code == 0 and json.loads(migrated.stdout)["newly_applied"] == [
-        "0001_foundation.sql", "0002_crawling.sql",
+        "0001_foundation.sql", "0002_crawling.sql", "0003_intelligence.sql",
     ]
     health = runner.invoke(app, ["health"])
     assert health.exit_code == 0 and json.loads(health.stdout)["migrations"] == "current"
